@@ -1346,8 +1346,17 @@ async def test_receive_kv_selects_remote_pp_workers(
             "receive_kv_from_single_worker",
             side_effect=fake_receive,
         ):
-            decode_worker.receive_kv("p-engine", pull_metas)
-            await asyncio.sleep(0)
+
+            async def receive_on_worker_loop():
+                decode_worker.receive_kv("p-engine", pull_metas)
+                await asyncio.gather(*tuple(decode_worker._receive_tasks))
+
+            await asyncio.wrap_future(
+                asyncio.run_coroutine_threadsafe(
+                    receive_on_worker_loop(),
+                    decode_worker.receiver_loop,
+                )
+            )
 
         assert seen_addrs == expected_addrs
         assert pull_metas["d-req-1"].pull_tasks_count == 0
@@ -2595,3 +2604,51 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()
+
+
+@pytest.mark.parametrize("blocks", [[], [[]]])
+@pytest.mark.parametrize("failed", [False, True])
+def test_cleanup_only_receive_never_completes_consumer(blocks, failed):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._pending_receives = {}
+    worker.finished_recving_reqs = set()
+    meta = PullReqMeta(
+        d_req_id="d",
+        transfer_id="attempt",
+        local_block_ids=blocks,
+        remote_engine_id="p",
+        remote_bootstrap_addr="http://p:33333",
+        failed=failed,
+    )
+    worker._finish_recv(meta)
+    assert worker.finished_recving_reqs == set()
+
+
+@pytest.mark.asyncio
+async def test_aborted_unready_producer_wakes_waiters_without_publishing_pages():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    ready = asyncio.Event()
+    worker.reqs_need_send = {"attempt": SendBlockMeta("p", "attempt", [], ready)}
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_not_processed = {"attempt", "already-removed"}
+    await worker.record_send_reqs(metadata)
+    assert ready.is_set()
+    assert worker.reqs_need_send == {}
+
+
+@pytest.mark.asyncio
+async def test_receiver_shutdown_waits_for_actual_producer_terminal():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.shutdown = MagicMock()
+    worker._receive_tasks = set()
+    worker._pending_receives = {}
+    terminal = asyncio.Event()
+    worker._spawn_receive_task(terminal.wait())
+    draining = asyncio.create_task(worker._drain_receiver())
+    await asyncio.sleep(0)
+    assert not draining.done()
+    terminal.set()
+    await asyncio.wait_for(draining, timeout=1)
+    assert not worker._receive_tasks

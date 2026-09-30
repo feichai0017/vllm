@@ -729,6 +729,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config, self.engine_id, kv_cache_config
             )
 
+    def shutdown(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig):
         if vllm_config.model_config is None:
@@ -1224,6 +1228,11 @@ class MooncakeConnectorWorker:
             self.transfer_endpoint,
         )
 
+        self._closing = False
+        self._shutdown_complete = False
+        self._receive_tasks: set[asyncio.Task] = set()
+        self._pending_receives: dict[TransferId, PullReqMeta] = {}
+        self._sender_listener_task: asyncio.Task | None = None
         self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = {}
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
@@ -1370,20 +1379,60 @@ class MooncakeConnectorWorker:
         self.shutdown()
 
     def shutdown(self):
-        """Cleanup background threads on destruction."""
-        self.async_zmq_ctx.term()
-        if not self.is_kv_consumer:
-            self._sender_executor.shutdown(wait=False)
-            if self.sender_loop.is_running():
-                self.sender_loop.call_soon_threadsafe(self.sender_loop.stop)
-                self._sender_listener_t.join()
-            if should_launch_bootstrap_server(self.vllm_config) and hasattr(
-                self, "bootstrap_server"
-            ):
-                self.bootstrap_server.shutdown()
-        if not self.is_kv_producer and self.receiver_loop.is_running():
-            self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
-            self._mooncake_receiver_t.join()
+        """Stop admission and retain registered tensors until every write drains."""
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._closing = True
+        sender_loop = getattr(self, "sender_loop", None)
+        if sender_loop is not None and sender_loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._drain_sender(), sender_loop).result()
+        executor = getattr(self, "_sender_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+        receiver_loop = getattr(self, "receiver_loop", None)
+        if receiver_loop is not None and receiver_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._drain_receiver(), receiver_loop
+            ).result()
+        for loop, thread_name in (
+            (sender_loop, "_sender_listener_t"),
+            (receiver_loop, "_mooncake_receiver_t"),
+        ):
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+                getattr(self, thread_name).join()
+        context = getattr(self, "async_zmq_ctx", None)
+        if context is not None:
+            context.term()
+        bootstrap = getattr(self, "bootstrap_server", None)
+        if bootstrap is not None:
+            bootstrap.shutdown()
+        self._shutdown_complete = True
+
+    async def _drain_sender(self) -> None:
+        # Waiters for a request that never became ready cannot submit any WRITE.
+        for send_meta in self.reqs_need_send.values():
+            if not send_meta.ready.is_set():
+                send_meta.ready.set()
+        listener = self._sender_listener_task
+        if listener is not None:
+            listener.cancel()
+            await asyncio.gather(listener, return_exceptions=True)
+
+    async def _drain_receiver(self) -> None:
+        while self._receive_tasks:
+            await asyncio.gather(*tuple(self._receive_tasks), return_exceptions=True)
+        while self._pending_receives:
+            logger.error(
+                "Retaining %d P/D destinations during shutdown without producer drain",
+                len(self._pending_receives),
+            )
+            await asyncio.sleep(1)
+
+    def _spawn_receive_task(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._receive_tasks.add(task)
+        task.add_done_callback(self._receive_tasks.discard)
 
     async def register_worker_with_bootstrap(self):
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
@@ -1439,6 +1488,7 @@ class MooncakeConnectorWorker:
         """Background thread that listens for Mooncake requests, dispatches them
         to a thread pool, and sends acknowledgments upon completion.
         """
+        self._sender_listener_task = asyncio.current_task()
         sock = self.async_zmq_ctx.socket(zmq.ROUTER)
         self.side_channel_port = sock.bind_to_random_port(f"tcp://{self.hostname}")
         logger.debug(
@@ -1447,7 +1497,11 @@ class MooncakeConnectorWorker:
             self.side_channel_port,
         )
 
-        await self.register_worker_with_bootstrap()
+        try:
+            await self.register_worker_with_bootstrap()
+        except BaseException:
+            sock.close(linger=0)
+            raise
 
         # Create async worker tasks that process items from the queue
         sender_tasks = [
@@ -1466,11 +1520,12 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("Error in Mooncake sender thread: %s. Exiting thread.", str(e))
         finally:
-            # Clean up worker tasks
+            # Cancelling an asyncio wrapper cannot cancel a running native WRITE.
+            await self.sender_worker_queue.join()
             for task in sender_tasks:
                 task.cancel()
             await asyncio.gather(*sender_tasks, return_exceptions=True)
-            sock.close()
+            sock.close(linger=0)
 
     async def _sender_worker(self, sock: zmq.asyncio.Socket):
         while True:
@@ -1497,6 +1552,19 @@ class MooncakeConnectorWorker:
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
+        if self._closing:
+            await sock.send_multipart(
+                (
+                    identity,
+                    self._encoder.encode(
+                        MooncakeXferResponse(
+                            status=MooncakeXferResponseStatus.ERROR,
+                            err_msg="Producer closed transfer admission",
+                        )
+                    ),
+                )
+            )
+            return
         if meta.transfer_engine != self.transfer_engine_name:
             response = MooncakeXferResponse(
                 status=MooncakeXferResponseStatus.ERROR,
@@ -1626,11 +1694,12 @@ class MooncakeConnectorWorker:
                 else MooncakeXferResponseStatus.FINISH
             )
             ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            expired_reqs: list[ReqId] = []
             for task in done:
                 d_req_id, send_meta = task.result()
                 del pending_reqs[d_req_id]
                 # Do we still in reqs_need_send (not expired)?
-                if send_meta.transfer_id in self.reqs_need_send:
+                if send_meta.transfer_id in self.reqs_need_send and not self._closing:
                     # Mark it sending to avoid expiration.
                     send_meta.sending += 1
                     if not send_meta.need_send:
@@ -1643,6 +1712,7 @@ class MooncakeConnectorWorker:
                     logger.warning(
                         "Request %s expired before sending on P side.", d_req_id
                     )
+                    expired_reqs.append(d_req_id)
 
             (
                 src_ptrs,
@@ -1656,6 +1726,7 @@ class MooncakeConnectorWorker:
                 local_regions,
                 remote_regions,
             )
+            err_reqs.extend(expired_reqs)
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
                 (d_req_id, send_meta)
@@ -1667,14 +1738,18 @@ class MooncakeConnectorWorker:
                 remote_session = meta.transfer_endpoint or (
                     f"{meta.remote_hostname}:{meta.remote_port}"
                 )
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
-                    src_ptrs,
-                    dst_ptrs,
-                    lengths,
-                )
+                try:
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                    )
+                except Exception:
+                    logger.exception("Native payload engine failed after drain")
+                    ret_value = -1
 
                 if ret_value != 0:
                     transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
@@ -1691,9 +1766,6 @@ class MooncakeConnectorWorker:
 
             for d_req_id, send_meta in ready_reqs:
                 send_meta.sending -= 1
-
-                if d_req_id in err_req_set:
-                    continue
 
                 send_meta.sent += 1
                 if (
@@ -2434,6 +2506,9 @@ class MooncakeConnectorWorker:
             logger.error("pulling kv_caches for %s failed: %s", failed, reason)
 
     def _finish_recv(self, pull_meta: PullReqMeta) -> None:
+        self._pending_receives.pop(pull_meta.transfer_id, None)
+        if not any(pull_meta.local_block_ids):
+            return
         if pull_meta.failed:
             invalid = {b for group in pull_meta.local_block_ids for b in group}
             if not invalid:
@@ -2532,7 +2607,7 @@ class MooncakeConnectorWorker:
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
         for worker_addr in worker_addrs:
-            asyncio.create_task(
+            self._spawn_receive_task(
                 self.receive_kv_from_single_worker(worker_addr, pull_metas)
             )
 
@@ -2565,8 +2640,10 @@ class MooncakeConnectorWorker:
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
         for remote_engine_id, pull_metas in reqs_to_recv.items():
+            for pull_meta in pull_metas.values():
+                self._pending_receives[pull_meta.transfer_id] = pull_meta
             if remote_engine_id not in self._remote_agents:
-                asyncio.create_task(
+                self._spawn_receive_task(
                     self.handle_new_engine_id(remote_engine_id, pull_metas)
                 )
             else:
@@ -2596,11 +2673,14 @@ class MooncakeConnectorWorker:
                         ready=asyncio.Event(),
                     )
         for transfer_id in metadata.reqs_not_processed:
-            send_meta = self.reqs_need_send.pop(transfer_id)
-            if send_meta:
-                assert not send_meta.ready.is_set()
+            removed_meta = self.reqs_need_send.pop(transfer_id, None)
+            if removed_meta is not None:
+                assert not removed_meta.ready.is_set()
+                removed_meta.ready.set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+        if self._closing:
+            raise RuntimeError("Mooncake P/D admission is closed")
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
