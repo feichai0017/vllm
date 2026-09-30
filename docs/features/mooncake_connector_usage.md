@@ -38,6 +38,30 @@ python examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py --p
 
 Now you can send requests to the proxy server through port 8000.
 
+## External payload engine
+
+Set `kv_connector_extra_config.transfer_engine_factory` to a locally installed,
+fully qualified factory name on both P and D. The factory is called with
+`hostname`, `protocol`, and `device_name` keyword arguments. It returns an engine
+with a nonempty `endpoint` string and these operations:
+
+- `batch_register_memory(addresses, lengths) -> int`: register the worker's KV
+  storage; zero means success.
+- `batch_transfer_sync_write(endpoint, sources, destinations, lengths) -> int`:
+  return zero only after all bytes complete, or nonzero after all submitted
+  writes terminate. Exceptions must also leave no writes in flight.
+
+The native connector retains scheduling, layout planning, bootstrap and request
+completion. It exchanges the engine's endpoint directly and rejects peers that
+select a different factory. Factory import or construction failure does not fall
+back to the built-in engine. The built-in `mooncake.engine.TransferEngine` is
+used when no factory is configured.
+
+This construction boundary does not itself provide remote cancellation or safe
+reclamation after permanent peer loss. A receive timeout retains destination
+pages while awaiting producer results; transport termination is still required
+before those pages can be reused.
+
 ## Environment Variables
 
 - `VLLM_MOONCAKE_BOOTSTRAP_PORT`: Port for Mooncake bootstrap server

@@ -219,6 +219,67 @@ class FakeMooncakeWrapper:
         return 0
 
 
+class FakePayloadEngine:
+    def __init__(self, *, hostname, protocol, device_name):
+        self.endpoint = "payload://worker/instance-7"
+        self.options = (hostname, protocol, device_name)
+
+
+def test_payload_factory_does_not_require_legacy_mooncake():
+    factory_path = f"{__name__}.FakePayloadEngine"
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        kv_connector_extra_config={
+            "transfer_engine_factory": factory_path,
+            "mooncake_protocol": "tcp",
+            "device_name": "nic0",
+        },
+    )
+    with set_current_vllm_config(config), patch_worker_dependencies():
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.TransferEngine",
+            None,
+        ):
+            worker = MooncakeConnectorWorker(
+                config, "engine", _make_test_kv_cache_config()
+            )
+        try:
+            assert isinstance(worker.engine, FakePayloadEngine)
+            assert worker.engine.options == ("127.0.0.1", "tcp", "nic0")
+            assert worker.transfer_endpoint == "payload://worker/instance-7"
+            assert worker.transfer_engine_name == factory_path
+        finally:
+            worker.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "remote_engine,remote_endpoint", [("other", "endpoint"), ("custom", "")]
+)
+async def test_payload_mismatch_is_rejected_before_transfer(
+    remote_engine, remote_endpoint
+):
+    config = create_vllm_config(kv_connector="MooncakeConnector", kv_role="kv_consumer")
+    with set_current_vllm_config(config), patch_worker_dependencies():
+        worker = MooncakeConnectorWorker(config, "engine", _make_test_kv_cache_config())
+        try:
+            worker.transfer_engine_name = "custom"
+            metadata = _xfer_meta(
+                [], {}, transfer_engine=remote_engine, transfer_endpoint=remote_endpoint
+            )
+            socket = AsyncMock()
+            await worker.send_kv_to_decode(b"consumer", socket, metadata)
+            response = worker._xfer_resp_decoder.decode(
+                socket.send_multipart.call_args.args[0][1]
+            )
+            assert response.status == MooncakeXferResponseStatus.ERROR
+            assert not worker.reqs_need_send
+        finally:
+            worker.shutdown()
+
+
 def test_align_transfer_regions_uses_layer_name_occurrences():
     """Repeated layer names should align by occurrence order."""
     local_regions = [

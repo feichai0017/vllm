@@ -51,6 +51,7 @@ from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
@@ -621,6 +622,8 @@ class MooncakeXferMetadata(
     # peer did not send the field, so the run must not be promoted.
     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
     remote_pp_size: int = 1
+    transfer_engine: str = "mooncake"
+    transfer_endpoint: str = ""
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -1156,9 +1159,6 @@ class MooncakeConnectorWorker:
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ):
-        if TransferEngine is None:
-            logger.error("Mooncake is not available")
-            raise RuntimeError("Mooncake is not available")
         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
 
         self.vllm_config = vllm_config
@@ -1167,7 +1167,6 @@ class MooncakeConnectorWorker:
         self.device_id = torch.accelerator.current_device_index()
         current_platform.set_device(self.device_id)
 
-        self.engine = TransferEngine()
         self.hostname = get_ip()
 
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
@@ -1189,18 +1188,40 @@ class MooncakeConnectorWorker:
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
-        ret_value = self.engine.initialize(
-            self.hostname, "P2PHANDSHAKE", protocol, device_name
+        factory_path = kv_transfer_config.kv_connector_extra_config.get(
+            "transfer_engine_factory"
         )
-        if ret_value != 0:
-            raise RuntimeError("Mooncake Transfer Engine initialization failed.")
-
-        self.rpc_port = self.engine.get_rpc_port()
+        self.transfer_engine_name = factory_path or "mooncake"
+        if factory_path is not None:
+            if not isinstance(factory_path, str) or not factory_path:
+                raise ValueError("transfer_engine_factory must be a qualified name")
+            factory = resolve_obj_by_qualname(factory_path)
+            self.engine = factory(
+                hostname=self.hostname, protocol=protocol, device_name=device_name
+            )
+            self.transfer_endpoint = self.engine.endpoint
+            if (
+                not isinstance(self.transfer_endpoint, str)
+                or not self.transfer_endpoint
+            ):
+                raise ValueError("Payload engine must expose a nonempty endpoint")
+            self.rpc_port = 0
+        else:
+            if TransferEngine is None:
+                raise RuntimeError("Mooncake is not available")
+            self.engine = TransferEngine()
+            ret_value = self.engine.initialize(
+                self.hostname, "P2PHANDSHAKE", protocol, device_name
+            )
+            if ret_value != 0:
+                raise RuntimeError("Mooncake Transfer Engine initialization failed.")
+            self.rpc_port = self.engine.get_rpc_port()
+            self.transfer_endpoint = f"{self.hostname}:{self.rpc_port}"
 
         logger.debug(
-            "Mooncake Transfer Engine initialized at %s:%d",
-            self.hostname,
-            self.rpc_port,
+            "Mooncake payload engine %s initialized at %s",
+            self.transfer_engine_name,
+            self.transfer_endpoint,
         )
 
         self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = {}
@@ -1476,6 +1497,20 @@ class MooncakeConnectorWorker:
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
+        if meta.transfer_engine != self.transfer_engine_name:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg="Producer and consumer payload engines do not match",
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+        if self.transfer_engine_name != "mooncake" and not meta.transfer_endpoint:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg="Consumer payload engine endpoint is missing",
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
@@ -1629,7 +1664,9 @@ class MooncakeConnectorWorker:
             ]
 
             if src_ptrs:
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                remote_session = meta.transfer_endpoint or (
+                    f"{meta.remote_hostname}:{meta.remote_port}"
+                )
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
@@ -2307,6 +2344,8 @@ class MooncakeConnectorWorker:
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
+            transfer_engine=self.transfer_engine_name,
+            transfer_endpoint=self.transfer_endpoint,
             remote_tp_size=self.tp_size,
             remote_tp_rank=self.tp_rank,
             remote_pp_size=self.pp_size,
