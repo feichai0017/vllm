@@ -2260,8 +2260,25 @@ class MooncakeConnectorWorker:
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
-        finished_sending_reqs, finished_recving_reqs = self.get_finished()
+        recv_fut = None
+        send_fut = None
+        if not self.is_kv_producer:
+            recv_fut = asyncio.run_coroutine_threadsafe(
+                self.fetch_recv_results(), self.receiver_loop
+            )
+        if not self.is_kv_consumer:
+            send_fut = asyncio.run_coroutine_threadsafe(
+                self.fetch_finished_sending_reqs(), self.sender_loop
+            )
+        results = recv_fut.result() if recv_fut else KVConnectorTransferResults()
+        results.finished_sending = send_fut.result() if send_fut else set()
+        return results
 
+    async def fetch_recv_results(self) -> KVConnectorTransferResults:
+        # Snapshot completion and failure on their owning loop, without an await
+        # between them. A failure must accompany its completion in the same poll.
+        finished_recving_reqs = self.finished_recving_reqs
+        self.finished_recving_reqs = set()
         failed_recving_reqs: set[ReqId] = set()
         while True:
             try:
@@ -2270,8 +2287,7 @@ class MooncakeConnectorWorker:
                 break
 
         return KVConnectorTransferResults(
-            finished_sending=set(finished_sending_reqs or ()),
-            finished_recving=set(finished_recving_reqs or ()),
+            finished_recving=finished_recving_reqs,
             failed_recving=failed_recving_reqs,
         )
 
@@ -2329,17 +2345,29 @@ class MooncakeConnectorWorker:
                 )
                 await sock.send(encoded_data)
                 while True:
-                    ret_msg = await sock.recv()
-                    response = self._xfer_resp_decoder.decode(ret_msg)
-                    if response.status == MooncakeXferResponseStatus.ERROR:
+                    try:
+                        ret_msg = await sock.recv()
+                    except zmq.Again:
+                        # The control deadline does not stop a remote WRITE.
+                        # Keep the destination until every producer responds.
                         self._handle_failed_recv(
                             pull_metas,
                             req_ids,
-                            response.err_msg or "transfer error",
+                            "waiting for producer drain after timeout",
                         )
-                        return
-                    self.process_pulling_result(response, pull_metas)
-                    if response.status == MooncakeXferResponseStatus.FINISH:
+                        continue
+                    response = self._xfer_resp_decoder.decode(ret_msg)
+                    if response.status == MooncakeXferResponseStatus.ERROR:
+                        response.err_reqs = list(req_ids)
+                    self.process_pulling_result(response, pull_metas, req_ids)
+                    if response.status in (
+                        MooncakeXferResponseStatus.FINISH,
+                        MooncakeXferResponseStatus.ERROR,
+                    ):
+                        if req_ids:
+                            self._handle_failed_recv(
+                                pull_metas, req_ids, "producer omitted transfer results"
+                            )
                         break
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
@@ -2353,7 +2381,7 @@ class MooncakeConnectorWorker:
         req_ids: Collection[ReqId],
         reason: str,
     ) -> None:
-        """Report a failed remote KV load so the scheduler can fail or recompute it."""
+        """Remember failure without authorizing destination page reuse."""
         failed: list[ReqId] = []
         for req_id in req_ids:
             pull_meta = pull_metas.get(req_id)
@@ -2363,23 +2391,20 @@ class MooncakeConnectorWorker:
             failed.append(req_id)
             self.xfer_stats.record_failed_recv()
 
+        if failed:
+            logger.error("pulling kv_caches for %s failed: %s", failed, reason)
+
+    def _finish_recv(self, pull_meta: PullReqMeta) -> None:
+        if pull_meta.failed:
             invalid = {b for group in pull_meta.local_block_ids for b in group}
             if not invalid:
-                # A pull with no local blocks only asks P to release its blocks
-                # for a request that never reached the scheduler (see
-                # AsyncLLM.notify_kv_transfer_request_rejected, which submits an
-                # abort_immediately request just to run request_finished). No D
-                # request is waiting on a load, and reporting one here would trip
-                # the scheduler's `assert req_id in self.requests`.
-                continue
+                # Rejected requests with no D pages only ask P to release.
+                return
             if self._is_hma_required:
                 self._failed_recv_reqs.put(pull_meta.d_req_id)
             else:
                 self._invalid_block_ids.put(invalid)
-            self.finished_recving_reqs.add(pull_meta.d_req_id)
-
-        if failed:
-            logger.error("pulling kv_caches for %s failed: %s", failed, reason)
+        self.finished_recving_reqs.add(pull_meta.d_req_id)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Drain the blocks whose remote KV load failed since the last call."""
@@ -2395,25 +2420,20 @@ class MooncakeConnectorWorker:
         self,
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
+        pending_req_ids: set[ReqId],
     ):
-        ok_reqs: list[ReqId] = response.ok_reqs or []
-
-        for req_id in ok_reqs:
+        failed = pending_req_ids.intersection(response.err_reqs or ())
+        completed = pending_req_ids.intersection(response.ok_reqs or ()) | failed
+        if failed:
+            self._handle_failed_recv(
+                pull_metas, failed, response.err_msg or "unknown error"
+            )
+        for req_id in completed:
+            pending_req_ids.remove(req_id)
             pull_meta = pull_metas[req_id]
-            if pull_meta.failed:
-                continue
-            # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
-
-        if ok_reqs:
-            logger.debug("pulling kv_caches for %s finished", ok_reqs)
-
-        if response.err_reqs:
-            self._handle_failed_recv(
-                pull_metas, response.err_reqs, response.err_msg or "unknown error"
-            )
+                self._finish_recv(pull_meta)
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
@@ -2496,6 +2516,8 @@ class MooncakeConnectorWorker:
                 f"remote engine_id {remote_engine_id} not found from bootstrap "
                 f"server {remote_bootstrap_addr}",
             )
+            for pull_meta in pull_metas.values():
+                self._finish_recv(pull_meta)
             return
 
         self.receive_kv(remote_engine_id, pull_metas)

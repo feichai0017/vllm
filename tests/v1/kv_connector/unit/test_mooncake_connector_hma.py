@@ -7,10 +7,11 @@ send trimming, and group-count invariant checking in _build_transfer_params.
 """
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
+import zmq
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
@@ -19,6 +20,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeConnectorMetadata,
     MooncakeConnectorScheduler,
     MooncakeXferMetadata,
+    MooncakeXferResponse,
+    MooncakeXferResponseStatus,
     PullReqMeta,
     SendBlockMeta,
     TransferRegion,
@@ -517,29 +520,97 @@ def test_worker_is_hma_required_multiple_full_attention_groups():
     assert worker._is_hma_required
 
 
-def test_worker_failed_recv_reports_request_level_failure_with_hma():
-    """With HMA, load failures report the request, not ambiguous block IDs."""
+@pytest.mark.parametrize("swa_enabled", [False, True])
+@pytest.mark.parametrize("last_worker_failed", [False, True])
+def test_failed_receive_waits_for_every_producer(swa_enabled, last_worker_failed):
+    """A failed producer must not release pages another producer still writes."""
+    worker = _make_kv_consumer_worker(swa_enabled=swa_enabled)
+    pull_meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
+    pull_meta.pull_tasks_count = 2
+    pull_metas = {"p-req-1": pull_meta}
+    first_producer_pending = {"p-req-1"}
+
+    try:
+        worker.process_pulling_result(
+            MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                err_reqs=["p-req-1"],
+                err_msg="producer failed",
+            ),
+            pull_metas,
+            first_producer_pending,
+        )
+        results = worker.get_transfer_results()
+        assert not results.finished_recving
+        assert not results.failed_recving
+        assert not worker.get_block_ids_with_load_errors()
+
+        # Repeated results from one producer cannot stand in for another.
+        worker.process_pulling_result(
+            MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH, ok_reqs=["p-req-1"]
+            ),
+            pull_metas,
+            first_producer_pending,
+        )
+        assert not worker.get_transfer_results().finished_recving
+
+        worker.process_pulling_result(
+            MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=None if last_worker_failed else ["p-req-1"],
+                err_reqs=["p-req-1"] if last_worker_failed else None,
+            ),
+            pull_metas,
+            {"p-req-1"},
+        )
+        results = worker.get_transfer_results()
+        assert results.finished_recving == {"d-req-1"}
+        assert results.failed_recving == ({"d-req-1"} if swa_enabled else set())
+        assert worker.get_block_ids_with_load_errors() == (
+            set() if swa_enabled else {1, 2, 3, 4}
+        )
+        assert not worker.get_transfer_results().finished_recving
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_receive_timeout_holds_pages_until_late_producer_result():
     worker = _make_kv_consumer_worker(swa_enabled=True)
-    assert worker._is_hma_required
-
     pull_meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
-    worker._handle_failed_recv({"p-req-1": pull_meta}, ["p-req-1"], "boom")
+    pull_meta.pull_tasks_count = 1
+    calls = 0
 
-    assert worker.get_block_ids_with_load_errors() == set()
-    results = worker.get_transfer_results()
-    assert results.failed_recving == {"d-req-1"}
-    assert results.finished_recving == {"d-req-1"}
+    async def recv():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise zmq.Again()
+        assert pull_meta.failed
+        assert not worker.get_transfer_results().finished_recving
+        assert not worker.get_block_ids_with_load_errors()
+        return worker._encoder.encode(
+            MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH, ok_reqs=["p-req-1"]
+            )
+        )
 
-
-def test_worker_failed_recv_reports_block_ids_without_hma():
-    """Without HMA, load failures keep reporting block-level errors."""
-    worker = _make_kv_consumer_worker(swa_enabled=False)
-    assert not worker._is_hma_required
-
-    pull_meta = _make_pull_meta("d-req-1", [[1, 2], [3, 4]])
-    worker._handle_failed_recv({"p-req-1": pull_meta}, ["p-req-1"], "boom")
-
-    assert worker.get_block_ids_with_load_errors() == {1, 2, 3, 4}
-    results = worker.get_transfer_results()
-    assert results.failed_recving == set()
-    assert results.finished_recving == {"d-req-1"}
+    socket = MagicMock()
+    socket.send = AsyncMock()
+    socket.recv = recv
+    socket.__enter__.return_value = socket
+    try:
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.make_zmq_socket",
+            return_value=socket,
+        ):
+            await worker.receive_kv_from_single_worker(
+                "tcp://producer:1234", {"p-req-1": pull_meta}
+            )
+        results = worker.get_transfer_results()
+        assert results.finished_recving == results.failed_recving == {"d-req-1"}
+        assert calls == 2
+    finally:
+        worker.shutdown()
